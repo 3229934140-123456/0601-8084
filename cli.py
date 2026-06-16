@@ -1,6 +1,5 @@
 import argparse
 import sys
-import ast
 from typing import List
 
 from sliding_window import (
@@ -12,11 +11,17 @@ from sliding_window import (
     format_violation_report,
     compare_strict_vs_compressed,
     format_comparison_report,
+    recommend_bucket_width,
+    format_recommend_report,
+    run_batch_experiment,
+    format_batch_report,
+    parse_batch_input,
+    parse_batch_input_with_keys,
+    format_multikey_batch_report,
 )
 
 
 def cmd_run(args):
-    """运行一次限流实验，逐请求打印结果"""
     N = args.N
     times = args.times
 
@@ -29,11 +34,9 @@ def cmd_run(args):
         )
         name = f"压缩滑动窗口 (桶宽={args.bucket}ms)"
     elif args.mode == "token-bucket":
-        limiter = TokenBucketLimiter(rate_per_second=N, capacity=args.capacity)
-        if args.capacity:
-            name = f"令牌桶 (rate={N}/s, capacity={args.capacity})"
-        else:
-            name = f"令牌桶 (rate={N}/s, capacity={N})"
+        cap = args.capacity if args.capacity else N
+        limiter = TokenBucketLimiter(rate_per_second=N, capacity=cap)
+        name = f"令牌桶 (rate={N}/s, capacity={cap})"
     else:
         print(f"未知模式: {args.mode}")
         return 1
@@ -61,7 +64,6 @@ def cmd_run(args):
     print("  " + "-" * 42)
     print(f"  总计: 通过 {len(all_allowed_times)}/{len(times)} 个请求")
 
-    # 验证：找出最坏窗口
     if all_allowed_times:
         worst_count = 0
         worst_win = None
@@ -85,7 +87,6 @@ def cmd_run(args):
 
 
 def cmd_tb_violate(args):
-    """演示令牌桶违反严格语义"""
     report = analyze_token_bucket_violation_strict(
         rate_per_second=args.N,
         capacity=args.capacity if args.capacity else args.N,
@@ -96,7 +97,6 @@ def cmd_tb_violate(args):
 
 
 def cmd_compare(args):
-    """对比严格版与压缩版"""
     times = args.times
 
     report = compare_strict_vs_compressed(
@@ -113,16 +113,91 @@ def cmd_compare(args):
     return 0
 
 
+def cmd_recommend(args):
+    rec = recommend_bucket_width(
+        max_per_second=args.N,
+        target_error_pct=args.error,
+        window_seconds=args.window,
+    )
+    print(format_recommend_report(rec))
+    return 0
+
+
+def cmd_batch(args):
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as f:
+            text = f.read()
+    elif args.input:
+        text = args.input
+    else:
+        print("错误: 需要 --file 或 --input 指定输入")
+        return 1
+
+    groups = parse_batch_input(text)
+    if not groups:
+        print("错误: 未能从输入中解析出任何场景")
+        return 1
+
+    report = run_batch_experiment(
+        groups=groups,
+        N=args.N,
+        window_seconds=args.window,
+        bucket_width_ms=args.bucket,
+        token_bucket_capacity=args.capacity,
+    )
+    print(format_batch_report(report))
+    return 0
+
+
 def cmd_multikey(args):
-    """演示按 key 限流"""
     mgr = MultiKeyRateLimiter(
         max_per_second=args.N,
         window_seconds=args.window,
         limiter_type=args.mode,
         bucket_width_ms=args.bucket,
         idle_ttl_seconds=args.ttl,
+        cleanup_interval_seconds=0.0,
     )
 
+    # 非交互模式
+    if args.requests:
+        requests = []
+        for pair in args.requests:
+            parts = pair.split(",")
+            if len(parts) == 2:
+                try:
+                    t = float(parts[0])
+                    key = parts[1]
+                    requests.append((t, key))
+                except ValueError:
+                    print(f"  忽略无效输入: {pair}")
+
+        cleanup_times = []
+        if args.cleanup_at:
+            cleanup_times = [float(x) for x in args.cleanup_at]
+
+        report = mgr.run_batch(requests, cleanup_check_times=cleanup_times)
+        print(format_multikey_batch_report(report))
+        return 0
+
+    # 从文件读取
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as f:
+            text = f.read()
+        requests = parse_batch_input_with_keys(text)
+        if not requests:
+            print("错误: 文件中未找到有效的 key 请求序列")
+            return 1
+
+        cleanup_times = []
+        if args.cleanup_at:
+            cleanup_times = [float(x) for x in args.cleanup_at]
+
+        report = mgr.run_batch(requests, cleanup_check_times=cleanup_times)
+        print(format_multikey_batch_report(report))
+        return 0
+
+    # 交互模式
     print("=" * 70)
     print(f"MultiKey 限流演示: mode={args.mode}, N={args.N}/s, idle_ttl={args.ttl}s")
     print("=" * 70)
@@ -173,17 +248,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 基本演示 - 严格滑动窗口
-  python cli.py run --mode strict -N 5 --times 0 0.1 0.2 0.3 0.4 0.5 0.99 1.0 1.01
+  # 单次限流实验
+  python cli.py run --mode strict -N 5 --times 0 0.1 0.2 0.3 0.4 0.5
 
   # 令牌桶违规演示
   python cli.py tb-violate -N 100
 
+  # 令牌桶未违规时自动提示建议
+  python cli.py tb-violate -N 10 --capacity 1
+
   # 压缩版 vs 严格版对比
   python cli.py compare -N 100 --bucket 10 --times 0 0.005 0.01 ...
 
-  # 按 key 限流交互式演示
-  python cli.py multikey --mode strict -N 10
+  # 按目标误差反推桶宽
+  python cli.py recommend -N 1000000 --error 0.1
+
+  # 批量实验（从文件）
+  python cli.py batch -N 5 --file scenarios.txt
+
+  # 按 key 非交互模式
+  python cli.py multikey -N 3 --requests 0.0,user_A 0.1,user_B 0.2,user_A 0.3,user_B
+
+  # 按 key 从文件读取
+  python cli.py multikey -N 3 --file keys.txt --ttl 5 --cleanup-at 10 20
 """,
     )
 
@@ -191,19 +278,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # -------- run --------
     p_run = subparsers.add_parser("run", help="运行一次限流实验")
-    p_run.add_argument(
-        "--mode", required=True,
-        choices=["strict", "compressed", "token-bucket"],
-        help="限流器模式",
-    )
+    p_run.add_argument("--mode", required=True, choices=["strict", "compressed", "token-bucket"])
     p_run.add_argument("-N", type=int, required=True, help="每秒限制次数")
     p_run.add_argument("--window", type=float, default=1.0, help="窗口大小(秒)")
     p_run.add_argument("--bucket", type=int, default=1, help="压缩版桶宽(ms)")
     p_run.add_argument("--capacity", type=int, default=None, help="令牌桶容量")
-    p_run.add_argument(
-        "--times", nargs="+", required=True,
-        help="请求时间序列，例如: 0 0.1 0.2 0.5 0.99 1.0",
-    )
+    p_run.add_argument("--times", nargs="+", required=True, help="请求时间序列")
     p_run.set_defaults(func=cmd_run)
 
     # -------- tb-violate --------
@@ -218,23 +298,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("-N", type=int, required=True, help="每秒限制次数")
     p_cmp.add_argument("--bucket", type=int, default=10, help="压缩版桶宽(ms)")
     p_cmp.add_argument("--window", type=float, default=1.0, help="窗口大小(秒)")
-    p_cmp.add_argument(
-        "--times", nargs="+", required=True,
-        help="请求时间序列",
-    )
+    p_cmp.add_argument("--times", nargs="+", required=True, help="请求时间序列")
     p_cmp.set_defaults(func=cmd_compare)
 
+    # -------- recommend --------
+    p_rec = subparsers.add_parser("recommend", help="按目标误差反推桶宽")
+    p_rec.add_argument("-N", type=int, required=True, help="每秒限制次数")
+    p_rec.add_argument("--error", type=float, required=True, help="可接受的误差百分比(如 0.1 表示 0.1%%)")
+    p_rec.add_argument("--window", type=float, default=1.0, help="窗口大小(秒)")
+    p_rec.set_defaults(func=cmd_recommend)
+
+    # -------- batch --------
+    p_batch = subparsers.add_parser("batch", help="批量实验: 多组序列 × 三种模式")
+    p_batch.add_argument("-N", type=int, required=True, help="每秒限制次数")
+    p_batch.add_argument("--window", type=float, default=1.0, help="窗口大小(秒)")
+    p_batch.add_argument("--bucket", type=int, default=10, help="压缩版桶宽(ms)")
+    p_batch.add_argument("--capacity", type=int, default=None, help="令牌桶容量")
+    p_batch.add_argument("--file", type=str, default=None, help="从文件读取场景")
+    p_batch.add_argument("--input", type=str, default=None, help="直接输入场景文本")
+    p_batch.set_defaults(func=cmd_batch)
+
     # -------- multikey --------
-    p_mk = subparsers.add_parser("multikey", help="交互式按 key 限流演示")
-    p_mk.add_argument(
-        "--mode", default="strict",
-        choices=["strict", "compressed", "token-bucket"],
-        help="限流器模式",
-    )
+    p_mk = subparsers.add_parser("multikey", help="按 key 限流(交互或非交互)")
+    p_mk.add_argument("--mode", default="strict", choices=["strict", "compressed", "token-bucket"])
     p_mk.add_argument("-N", type=int, default=10, help="每 key 每秒限制次数")
     p_mk.add_argument("--window", type=float, default=1.0, help="窗口大小(秒)")
     p_mk.add_argument("--bucket", type=int, default=1, help="压缩版桶宽(ms)")
     p_mk.add_argument("--ttl", type=float, default=60.0, help="key 空闲过期时间(秒)")
+    p_mk.add_argument("--requests", nargs="+", default=None,
+                       help="非交互模式: 时间,key 序列 (如 0.0,user_A 0.1,user_B)")
+    p_mk.add_argument("--file", type=str, default=None,
+                       help="从文件读取 key 请求序列 (每行: 时间 key)")
+    p_mk.add_argument("--cleanup-at", nargs="+", type=float, default=None,
+                       help="在这些时间点检查清理效果 (如 10 20 30)")
     p_mk.set_defaults(func=cmd_multikey)
 
     return parser

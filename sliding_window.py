@@ -1,5 +1,6 @@
 import time
 import bisect
+import math
 import heapq
 from collections import deque
 from typing import Optional, Tuple, List, Dict, Any, Union
@@ -42,7 +43,6 @@ class StrictSlidingWindowLimiter:
         return False, current_count
 
     def count_in_window(self, t_end: float) -> int:
-        """返回严格左开右闭窗口 (t_end - window, t_end] 内的请求数"""
         t_start = t_end - self.window_seconds
         count = 0
         for ts in self._timestamps:
@@ -196,13 +196,24 @@ class CompressedSlidingWindowLimiter:
     def error_report(self) -> Dict[str, Any]:
         """
         输出直观的误差分析报告
+
+        低阈值修正：当 N * B / (W * 1000) < 1 时，int() 截断为 0，
+        但实际误差至少为 1 个桶——因为桶边界无法精确切割窗口，
+        即使该桶内只有 1 个请求，也可能被多/少算。
+        所以：
+          worst_case_extra = max(1, int(N * B / (W * 1000)))
+          当 N 很小时，1 个桶内的请求数就是 1（最坏情况），不可忽略。
         """
         N = self.max_per_second
         B_ms = self.bucket_width_ms
         W_sec = self.window_seconds
 
-        max_extra_allowed = int(N * B_ms / (W_sec * 1000))
-        error_ratio_upper = max_extra_allowed / N * 100
+        requests_per_bucket = N * B_ms / (W_sec * 1000)
+        max_extra = max(1, int(requests_per_bucket))
+        if requests_per_bucket > 0 and int(requests_per_bucket) == 0:
+            max_extra = 1
+        error_ratio_upper = max_extra / N * 100 if N > 0 else 0
+
         memory = self.memory_bytes()
         strict_memory = N * 8
 
@@ -228,6 +239,7 @@ class CompressedSlidingWindowLimiter:
                 "window_seconds": W_sec,
                 "bucket_width_ms": B_ms,
                 "num_buckets": self.num_buckets,
+                "requests_per_bucket": requests_per_bucket,
             },
             "memory": {
                 "compressed_bytes": memory,
@@ -237,10 +249,13 @@ class CompressedSlidingWindowLimiter:
                 "savings_ratio": (1 - memory / strict_memory) * 100 if strict_memory > 0 else 0,
             },
             "precision": {
-                "worst_case_extra_allowed": max_extra_allowed,
-                "worst_case_extra_blocked": max_extra_allowed,
+                "worst_case_extra_allowed": max_extra,
+                "worst_case_extra_blocked": max_extra,
                 "relative_error_pct_max": error_ratio_upper,
-                "note": "误差来源于桶边界无法精确切割；最坏情况下 1 个整桶的请求被多/少算",
+                "note": (
+                    f"每桶平均请求={requests_per_bucket:.2f}, 最坏情况1个整桶被多/少算; "
+                    f"当 N={N}, B={B_ms}ms 时, 每桶最多 {max(1, math.ceil(requests_per_bucket))} 个请求可能被错误计入"
+                ),
             },
             "recommendation": {
                 "适用场景": scenario,
@@ -261,6 +276,7 @@ class CompressedSlidingWindowLimiter:
             "=" * 60,
             f"  参数: N={p['N (max_per_second)']:,}/s, 窗口={p['window_seconds']}s, "
             f"桶宽={p['bucket_width_ms']}ms, 桶数={p['num_buckets']}",
+            f"  每桶平均请求数: {p['requests_per_bucket']:.2f}",
             "",
             "  内存占用:",
             f"    压缩版本:   {m['compressed_bytes']:,} B = {m['compressed_kb']:.2f} KB",
@@ -296,7 +312,151 @@ class CompressedSlidingWindowLimiter:
 
 
 # ============================================================================
-# 4. 令牌桶违规分析（严格左开右闭窗口）
+# 3b. 按目标误差反推桶宽
+# ============================================================================
+
+def recommend_bucket_width(
+    max_per_second: int,
+    target_error_pct: float,
+    window_seconds: float = 1.0,
+    max_bucket_ms: int = 1000,
+) -> Dict[str, Any]:
+    """
+    给定 N 和可接受的误差比例，反推推荐桶宽方案
+
+    原理：
+      相对误差上界 = max(1, ceil(N * B / (W * 1000))) / N * 100
+      要让误差 <= target_error_pct:
+        max(1, ceil(N * B / (W * 1000))) / N * 100 <= target_error_pct
+
+      当 N 较大时 (N * B / 1000 >= 1):
+        B <= target_error_pct / 100 * W * 1000
+      当 N 较小时 (N * B / 1000 < 1), 误差至少 1/N*100:
+        若 1/N * 100 > target_error_pct, 则无法满足
+
+    返回多组方案（偏精确 / 均衡 / 偏省内存）
+    """
+    N = max_per_second
+    W = window_seconds
+    min_possible_error = 1.0 / N * 100 if N > 0 else 100.0
+
+    if target_error_pct < min_possible_error:
+        return {
+            "feasible": False,
+            "reason": (
+                f"N={N} 时，即使桶宽无限小，分桶误差下界为 1/{N}*100 = {min_possible_error:.3f}%, "
+                f"无法满足目标误差 {target_error_pct}%。"
+                f"建议提高 N 或放宽误差要求至 ≥ {min_possible_error:.3f}%"
+            ),
+            "min_possible_error_pct": min_possible_error,
+            "plans": [],
+        }
+
+    B_max_for_target = int(target_error_pct / 100 * W * 1000)
+    B_max_for_target = max(1, B_max_for_target)
+
+    candidates = []
+    for B_ms in [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]:
+        if B_ms > B_max_for_target:
+            continue
+
+        comp = CompressedSlidingWindowLimiter(N, W, B_ms)
+        report = comp.error_report()
+        actual_error = report["precision"]["relative_error_pct_max"]
+
+        if actual_error <= target_error_pct:
+            candidates.append({
+                "bucket_width_ms": B_ms,
+                "num_buckets": comp.num_buckets,
+                "actual_error_pct": actual_error,
+                "memory_bytes": comp.memory_bytes(),
+                "memory_kb": comp.memory_bytes() / 1024,
+                "extra_requests": report["precision"]["worst_case_extra_allowed"],
+                "style": "",
+            })
+
+    if not candidates:
+        return {
+            "feasible": False,
+            "reason": f"在目标误差 {target_error_pct}% 下未找到合适桶宽，请放宽误差或增大 N",
+            "min_possible_error_pct": min_possible_error,
+            "plans": [],
+        }
+
+    candidates.sort(key=lambda c: c["bucket_width_ms"])
+
+    if len(candidates) >= 3:
+        candidates[0]["style"] = "偏精确（桶窄，内存稍多）"
+        candidates[len(candidates) // 2]["style"] = "均衡"
+        candidates[-1]["style"] = "偏省内存（桶宽，精度稍低）"
+    elif len(candidates) == 2:
+        candidates[0]["style"] = "偏精确"
+        candidates[1]["style"] = "偏省内存"
+    else:
+        candidates[0]["style"] = "唯一可行方案"
+
+    return {
+        "feasible": True,
+        "params": {
+            "N": N,
+            "window_seconds": W,
+            "target_error_pct": target_error_pct,
+            "min_possible_error_pct": min_possible_error,
+            "max_bucket_ms_for_target": B_max_for_target,
+        },
+        "plans": candidates,
+    }
+
+
+def format_recommend_report(rec: Dict[str, Any]) -> str:
+    lines = [
+        "=" * 70,
+        "压缩滑动窗口 - 桶宽推荐报告",
+        "=" * 70,
+    ]
+
+    if not rec["feasible"]:
+        lines += [
+            "",
+            f"  ⚠️  无法满足目标误差",
+            f"  原因: {rec['reason']}",
+            "",
+            "=" * 70,
+        ]
+        return "\n".join(lines)
+
+    p = rec["params"]
+    lines += [
+        f"  参数: N={p['N']:,}/s, 窗口={p['window_seconds']}s, "
+        f"目标误差≤{p['target_error_pct']}%",
+        f"  误差下界(理论最小): {p['min_possible_error_pct']:.3f}% (1/N*100)",
+        f"  满足条件的最大桶宽: {p['max_bucket_ms_for_target']}ms",
+        "",
+        f"  {'桶宽(ms)':>9}  {'桶数':>5}  {'实际误差%':>9}  "
+        f"{'内存(B)':>9}  {'多放行':>6}  {'方案特点'}",
+        "  " + "-" * 65,
+    ]
+
+    for plan in rec["plans"]:
+        lines.append(
+            f"  {plan['bucket_width_ms']:>9}  {plan['num_buckets']:>5}  "
+            f"{plan['actual_error_pct']:>9.3f}  {plan['memory_bytes']:>9,}  "
+            f"{plan['extra_requests']:>6}  {plan['style']}"
+        )
+
+    lines += [
+        "",
+        "  建议:",
+        "    选偏精确方案 → 精度优先，适合计费/配额场景",
+        "    选均衡方案   → 精度与内存兼顾，适合一般 API 网关",
+        "    选偏省内存   → 内存优先，适合海量 key / 边缘部署",
+        "=" * 70,
+    ]
+    return "\n".join(lines)
+
+
+# ============================================================================
+# 4. 令牌桶违规分析（严格左开右闭窗口，含无违规提示）
 # ============================================================================
 
 def analyze_token_bucket_violation_strict(
@@ -307,14 +467,7 @@ def analyze_token_bucket_violation_strict(
     """
     严格分析令牌桶违反滑动窗口语义的情况
 
-    选取的检查窗口：
-      - 窗口 W_A = (T_A - window, T_A]，其中 T_A 是所有请求通过后
-      - 逐一遍历每个通过请求的时间戳 t，检查窗口 (t - window, t]
-
-    这样保证：
-      - 窗口严格左开右闭
-      - 只检查真实落在窗口内的请求
-      - 明确指出违规窗口的起止时间和包含的请求
+    新增：当参数不足以触发违规时，明确说明并给出建议参数
     """
     if capacity is None:
         capacity = rate_per_second
@@ -326,7 +479,6 @@ def analyze_token_bucket_violation_strict(
 
     request_events: List[Tuple[float, str]] = []
 
-    # 场景：在 T=0 突发发送 capacity 个请求（即令牌桶满桶时的容量）
     T_BURST = 0.0
     tb_allowed_times: List[float] = []
     ss_allowed_times: List[float] = []
@@ -347,32 +499,35 @@ def analyze_token_bucket_violation_strict(
 
     request_events.append((T_BURST, f"突发 {len(tb_allowed_times)} 个请求"))
 
-    # 然后在 T = window - ε（刚好窗口结束前）再持续发送
     T_CONTINUE = window_seconds - 1e-6
+    tb_continue_count = 0
     while True:
         ok, _ = tb.allow(now=T_CONTINUE)
         if ok:
             tb_allowed_times.append(T_CONTINUE)
+            tb_continue_count += 1
         else:
             break
-    # 严格滑动窗口
+
+    ss_continue_count = 0
     while True:
         ok, _ = ss.allow(now=T_CONTINUE)
         if ok:
             ss_allowed_times.append(T_CONTINUE)
+            ss_continue_count += 1
         else:
             break
 
-    request_events.append((T_CONTINUE, f"窗口结束前再通过 {len([t for t in tb_allowed_times if t == T_CONTINUE])} 个"))
+    request_events.append(
+        (T_CONTINUE, f"窗口结束前令牌桶再通过 {tb_continue_count} 个, 严格版再通过 {ss_continue_count} 个")
+    )
 
-    # --- 严格检查：找出令牌桶违规的那个窗口 ---
     worst_window = None
     worst_count = 0
     worst_t_end = None
 
     all_tb_times = sorted(tb_allowed_times)
 
-    # 对每个通过的请求，以它的时间为窗口右端点
     for t_end in all_tb_times:
         t_start = t_end - window_seconds
         count = sum(1 for ts in all_tb_times if t_start < ts <= t_end)
@@ -382,8 +537,8 @@ def analyze_token_bucket_violation_strict(
             worst_window = (t_start, t_end)
 
     violation_count = max(0, worst_count - N)
+    is_violated = worst_count > N
 
-    # 收集落在最坏窗口内的请求明细
     if worst_window:
         ws, we = worst_window
         inside = [ts for ts in all_tb_times if ws < ts <= we]
@@ -395,13 +550,34 @@ def analyze_token_bucket_violation_strict(
         inside_summary = {}
         inside = []
 
-    # 对比严格滑动窗口的结果
     ss_worst_count = 0
     all_ss_times = sorted(ss_allowed_times)
     for t_end in all_ss_times:
         t_start = t_end - window_seconds
         c = sum(1 for ts in all_ss_times if t_start < ts <= t_end)
         ss_worst_count = max(ss_worst_count, c)
+
+    suggestion = None
+    if not is_violated:
+        if capacity < N:
+            suggestion = (
+                f"当前 capacity={capacity} < rate={N}，桶容量不足以填满 1 秒窗口。"
+                f"建议将 capacity 设为 N={N} 或更大，使 T=0 时桶满突发通过 N 个，"
+                f"1 秒后再补充 N 个令牌，才能触发 2N 的违规。"
+            )
+        elif capacity == 1:
+            suggestion = (
+                f"当前 capacity=1 太小，无法积累突发。"
+                f"建议 capacity >= {N}，令牌桶才能在满桶时瞬间放行足够请求。"
+            )
+        else:
+            suggestion = (
+                f"当前参数下未触发违规，可能是因为 capacity={capacity} 不够大"
+                f"或 window={window_seconds}s 的充能不足以产生跨越窗口的令牌重叠。"
+                f"建议: capacity >= {N} 且 window_seconds >= 1.0"
+            )
+    else:
+        suggestion = None
 
     return {
         "params": {
@@ -416,6 +592,7 @@ def analyze_token_bucket_violation_strict(
             "worst_window_count": worst_count,
             "worst_window_t_end": worst_t_end,
             "violation_count": violation_count,
+            "is_violated": is_violated,
             "violation_ratio": worst_count / N if N > 0 else 0,
             "requests_in_worst_window": inside_summary,
             "request_times_sample": all_tb_times[:20],
@@ -425,16 +602,18 @@ def analyze_token_bucket_violation_strict(
             "worst_window_count": ss_worst_count,
             "violation": ss_worst_count > N,
         },
+        "is_violated": is_violated,
+        "suggestion": suggestion,
         "explanation": (
             f"令牌桶在 T=0 时因为桶是满的，立即通过了 capacity={capacity} 个请求；"
             f"经过 {window_seconds}s 的充能，又补充了约 {N} 个令牌；"
-            f"因此在跨越 0 时刻的窗口内，合计通过了 {worst_count} > {N} 个请求。"
+            f"因此在跨越 0 时刻的窗口内，合计通过了 {worst_count}"
+            + (f" > {N} 个请求。" if is_violated else f" ≤ {N} 个请求，未超出限制。")
         ),
     }
 
 
 def format_violation_report(report: Dict[str, Any]) -> str:
-    """将违规分析格式化为易读的终端输出"""
     p = report["params"]
     tb = report["token_bucket"]
     ss = report["strict_sliding_window"]
@@ -461,24 +640,38 @@ def format_violation_report(report: Dict[str, Any]) -> str:
         "",
     ]
 
-    if tb["worst_window"]:
-        ws, we = tb["worst_window"]
-        lines += [
-            f"  ★ 发现违规窗口:",
-            f"    W = ({ws:.6f}s, {we:.6f}s]     ← 左开右闭",
-            f"    窗口内请求数: {tb['worst_window_count']}",
-            f"    限制 N = {p['N']}",
-            f"    超出: {tb['violation_count']} 个 ({tb['violation_ratio']*100:.1f}%)",
-            "",
-            f"    窗口内各时间点请求明细:",
-        ]
-        for ts_key, cnt in sorted(tb["requests_in_worst_window"].items()):
-            lines.append(f"      t = {ts_key}: {cnt} 个请求")
+    if tb["is_violated"]:
+        if tb["worst_window"]:
+            ws, we = tb["worst_window"]
+            lines += [
+                f"  ★ 发现违规窗口:",
+                f"    W = ({ws:.6f}s, {we:.6f}s]     ← 左开右闭",
+                f"    窗口内请求数: {tb['worst_window_count']}",
+                f"    限制 N = {p['N']}",
+                f"    超出: {tb['violation_count']} 个 ({tb['violation_ratio']*100:.1f}%)",
+                "",
+                f"    窗口内各时间点请求明细:",
+            ]
+            for ts_key, cnt in sorted(tb["requests_in_worst_window"].items()):
+                lines.append(f"      t = {ts_key}: {cnt} 个请求")
 
+            lines += [
+                "",
+                f"    为什么会超？{report['explanation']}",
+            ]
+    else:
         lines += [
-            "",
-            f"    为什么会超？{report['explanation']}",
+            f"  ✓ 当前参数下未发现违规",
+            f"    最坏窗口内请求数: {tb['worst_window_count']}",
+            f"    限制 N = {p['N']}",
+            f"    令牌桶在此参数下恰好满足严格语义",
         ]
+        if report["suggestion"]:
+            lines += [
+                "",
+                f"  💡 如需复现违规，可调整参数:",
+                f"    {report['suggestion']}",
+            ]
 
     lines += [
         "",
@@ -502,13 +695,13 @@ LimiterType = Union[StrictSlidingWindowLimiter, CompressedSlidingWindowLimiter, 
 
 class MultiKeyRateLimiter:
     """
-    按 Key 限流的管理器（类似真实网关按 IP / 用户 ID 维度限流）
+    按 Key 限流的管理器
 
     特性：
-      - 每个 key 拥有独立的限流器实例，互不干扰
-      - 支持三种限流器后端：strict / compressed / token-bucket
-      - 自动清理长时间未活动的 key，防止内存泄漏
-      - 清理策略：惰性清理 + 定期主动清理
+      - 每个 key 独立限流器实例
+      - 支持三种后端
+      - 自动清理长时间未活动的 key
+      - 支持批量非交互模式
     """
 
     def __init__(
@@ -520,15 +713,6 @@ class MultiKeyRateLimiter:
         idle_ttl_seconds: float = 60.0,
         cleanup_interval_seconds: float = 10.0,
     ):
-        """
-        Args:
-            max_per_second: 每个 key 的限流阈值
-            window_seconds: 窗口大小
-            limiter_type: "strict" | "compressed" | "token-bucket"
-            bucket_width_ms: 仅 compressed 模式使用，微桶宽度
-            idle_ttl_seconds: key 空闲超过此时间自动清理
-            cleanup_interval_seconds: 主动清理的最小间隔
-        """
         self.max_per_second = max_per_second
         self.window_seconds = window_seconds
         self.limiter_type = limiter_type
@@ -579,7 +763,6 @@ class MultiKeyRateLimiter:
         return ok, count
 
     def cleanup_expired(self, now: Optional[float] = None) -> int:
-        """强制触发一次清理，返回被清理的 key 数量"""
         if now is None:
             now = time.monotonic()
 
@@ -609,6 +792,130 @@ class MultiKeyRateLimiter:
         self._last_activity.clear()
         self._last_cleanup = 0.0
 
+    def run_batch(
+        self,
+        requests: List[Tuple[float, str]],
+        cleanup_check_times: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        """
+        非交互批量模式
+
+        Args:
+            requests: [(time, key), ...] 按时间排序的请求序列
+            cleanup_check_times: 在这些时间点额外检查清理效果
+
+        Returns:
+            每个请求的决策、每个 key 的汇总、活跃 key 数变化、清理结果
+        """
+        results: List[Dict[str, Any]] = []
+        key_stats: Dict[str, Dict[str, int]] = {}
+        key_activity_timeline: List[Dict[str, Any]] = []
+        cleanup_events: List[Dict[str, Any]] = []
+
+        for t, key in requests:
+            ok, count = self.allow(key, now=t)
+            results.append({
+                "time": t,
+                "key": key,
+                "allowed": ok,
+                "count": count,
+            })
+
+            if key not in key_stats:
+                key_stats[key] = {"allowed": 0, "rejected": 0}
+            if ok:
+                key_stats[key]["allowed"] += 1
+            else:
+                key_stats[key]["rejected"] += 1
+
+            key_activity_timeline.append({
+                "time": t,
+                "active_keys": self.active_key_count,
+                "event": f"key={key} {'ALLOW' if ok else 'REJECT'}",
+            })
+
+        if cleanup_check_times:
+            for ct in cleanup_check_times:
+                before = self.active_key_count
+                cleaned = self.cleanup_expired(now=ct)
+                cleanup_events.append({
+                    "time": ct,
+                    "active_keys_before": before,
+                    "active_keys_after": self.active_key_count,
+                    "cleaned_count": cleaned,
+                })
+
+        return {
+            "results": results,
+            "key_stats": key_stats,
+            "key_activity_timeline": key_activity_timeline,
+            "cleanup_events": cleanup_events,
+            "final_active_key_count": self.active_key_count,
+            "final_active_keys": self.get_active_keys(),
+        }
+
+
+def format_multikey_batch_report(report: Dict[str, Any]) -> str:
+    lines = [
+        "=" * 70,
+        "MultiKey 批量限流报告",
+        "=" * 70,
+        "",
+        "  ──────────────────────────────────────────",
+        "  逐请求结果:",
+        f"  {'#':>4}  {'时间(s)':>10}  {'Key':>10}  {'结果':>6}  {'计数':>5}",
+        "  " + "-" * 45,
+    ]
+
+    for idx, r in enumerate(report["results"]):
+        status = "ALLOW" if r["allowed"] else "REJECT"
+        lines.append(
+            f"  {idx:>4}  {r['time']:>10.4f}  {r['key']:>10}  {status:>6}  {r['count']:>5}"
+        )
+
+    lines += [
+        "  " + "-" * 45,
+        "",
+        "  ──────────────────────────────────────────",
+        "  各 Key 汇总:",
+    ]
+    for key, stats in sorted(report["key_stats"].items()):
+        total = stats["allowed"] + stats["rejected"]
+        lines.append(
+            f"    {key:>15}: 通过 {stats['allowed']:>3}/{total:<3}, "
+            f"拒绝 {stats['rejected']:>3}"
+        )
+
+    lines += [
+        "",
+        "  ──────────────────────────────────────────",
+        "  活跃 Key 数变化:",
+    ]
+    for entry in report["key_activity_timeline"]:
+        lines.append(
+            f"    t={entry['time']:>8.4f}s  active_keys={entry['active_keys']:>3}  {entry['event']}"
+        )
+
+    if report["cleanup_events"]:
+        lines += [
+            "",
+            "  ──────────────────────────────────────────",
+            "  清理事件:",
+        ]
+        for ce in report["cleanup_events"]:
+            lines.append(
+                f"    t={ce['time']:>8.4f}s  清理前={ce['active_keys_before']}  "
+                f"清理后={ce['active_keys_after']}  清理数={ce['cleaned_count']}"
+            )
+
+    lines += [
+        "",
+        f"  最终活跃 key 数: {report['final_active_key_count']}",
+        f"  最终活跃 keys: {report['final_active_keys']}",
+        "=" * 70,
+    ]
+    return "\n".join(lines)
+
 
 # ============================================================================
 # 6. 压缩版 vs 严格版逐点差异对比
@@ -620,17 +927,14 @@ def compare_strict_vs_compressed(
     bucket_width_ms: int = 10,
     window_seconds: float = 1.0,
 ) -> Dict[str, Any]:
-    """
-    对给定请求时间序列，逐请求对比严格版和压缩版的决策差异
-    """
     strict = StrictSlidingWindowLimiter(max_per_second, window_seconds)
     comp = CompressedSlidingWindowLimiter(max_per_second, window_seconds, bucket_width_ms)
 
     diffs: List[Dict[str, Any]] = []
     strict_allowed: List[float] = []
     comp_allowed: List[float] = []
-    false_positives = 0  # 压缩版放行但严格版拒绝（多放行）
-    false_negatives = 0  # 压缩版拒绝但严格版放行（多拒绝）
+    false_positives = 0
+    false_negatives = 0
     matches = 0
 
     for idx, t in enumerate(request_times):
@@ -663,7 +967,6 @@ def compare_strict_vs_compressed(
                 "compressed_decision": f"REJECT (count={cnt_c})",
             })
 
-    # 检查两者的最坏窗口计数
     def worst_window_count(times: List[float]) -> Tuple[int, Tuple[float, float]]:
         worst = 0
         worst_win = (0.0, 0.0)
@@ -677,6 +980,8 @@ def compare_strict_vs_compressed(
 
     strict_worst, strict_win = worst_window_count(strict_allowed)
     comp_worst, comp_win = worst_window_count(comp_allowed)
+
+    comp_err = CompressedSlidingWindowLimiter(max_per_second, window_seconds, bucket_width_ms)
 
     return {
         "params": {
@@ -745,3 +1050,232 @@ def format_comparison_report(report: Dict[str, Any]) -> str:
 
     lines.append("=" * 70)
     return "\n".join(lines)
+
+
+# ============================================================================
+# 7. 批量实验：多组请求序列 + 三种模式对比
+# ============================================================================
+
+def run_batch_experiment(
+    groups: List[Dict[str, Any]],
+    N: int,
+    window_seconds: float = 1.0,
+    bucket_width_ms: int = 10,
+    token_bucket_capacity: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    批量实验：对每组请求时间序列，分别跑三种限流器
+
+    Args:
+        groups: [{"name": "场景1", "times": [0.0, 0.1, ...]}, ...]
+        N: 限流阈值
+        window_seconds: 窗口大小
+        bucket_width_ms: 压缩版桶宽
+        token_bucket_capacity: 令牌桶容量
+
+    Returns:
+        每组的通过数、拒绝数、最坏窗口、差异摘要
+    """
+    capacity = token_bucket_capacity if token_bucket_capacity else N
+    group_results = []
+
+    for group in groups:
+        name = group.get("name", "unnamed")
+        times = [float(t) for t in group["times"]]
+
+        strict = StrictSlidingWindowLimiter(N, window_seconds)
+        comp = CompressedSlidingWindowLimiter(N, window_seconds, bucket_width_ms)
+        tb = TokenBucketLimiter(N, capacity=capacity)
+
+        strict_allowed = []
+        comp_allowed = []
+        tb_allowed = []
+
+        for t in times:
+            ok_s, _ = strict.allow(now=t)
+            ok_c, _ = comp.allow(now=t)
+            ok_t, _ = tb.allow(now=t)
+            if ok_s:
+                strict_allowed.append(t)
+            if ok_c:
+                comp_allowed.append(t)
+            if ok_t:
+                tb_allowed.append(t)
+
+        def worst_count(allowed_times: List[float]) -> Tuple[int, Tuple[float, float]]:
+            worst = 0
+            win = (0.0, 0.0)
+            for t_end in allowed_times:
+                t_start = t_end - window_seconds
+                c = sum(1 for ts in allowed_times if t_start < ts <= t_end)
+                if c > worst:
+                    worst = c
+                    win = (t_start, t_end)
+            return worst, win
+
+        s_worst, s_win = worst_count(strict_allowed)
+        c_worst, c_win = worst_count(comp_allowed)
+        t_worst, t_win = worst_count(tb_allowed)
+
+        group_results.append({
+            "name": name,
+            "total_requests": len(times),
+            "strict": {
+                "allowed": len(strict_allowed),
+                "rejected": len(times) - len(strict_allowed),
+                "worst_window_count": s_worst,
+                "worst_window": s_win,
+                "violates": s_worst > N,
+            },
+            "compressed": {
+                "allowed": len(comp_allowed),
+                "rejected": len(times) - len(comp_allowed),
+                "worst_window_count": c_worst,
+                "worst_window": c_win,
+                "violates": c_worst > N,
+            },
+            "token_bucket": {
+                "allowed": len(tb_allowed),
+                "rejected": len(times) - len(tb_allowed),
+                "worst_window_count": t_worst,
+                "worst_window": t_win,
+                "violates": t_worst > N,
+            },
+        })
+
+    return {
+        "params": {
+            "N": N,
+            "window_seconds": window_seconds,
+            "bucket_width_ms": bucket_width_ms,
+            "token_bucket_capacity": capacity,
+        },
+        "groups": group_results,
+    }
+
+
+def format_batch_report(report: Dict[str, Any]) -> str:
+    p = report["params"]
+
+    lines = [
+        "=" * 78,
+        "批量实验报告 - 三种限流器对比",
+        "=" * 78,
+        f"  公共参数: N={p['N']}/s, 窗口={p['window_seconds']}s, "
+        f"压缩桶宽={p['bucket_width_ms']}ms, 令牌桶容量={p['token_bucket_capacity']}",
+        "",
+    ]
+
+    for g in report["groups"]:
+        lines += [
+            f"  ──────────────────────────────────────────────────────────────────",
+            f"  场景: {g['name']}  (总请求={g['total_requests']})",
+            f"  {'':>12} {'通过':>6} {'拒绝':>6} {'最坏窗口计数':>12} {'是否违规':>8}",
+            f"  {'严格滑动窗口':>12} {g['strict']['allowed']:>6} {g['strict']['rejected']:>6} "
+            f"{g['strict']['worst_window_count']:>12} {'❌' if g['strict']['violates'] else '✓':>8}",
+            f"  {'压缩滑动窗口':>12} {g['compressed']['allowed']:>6} {g['compressed']['rejected']:>6} "
+            f"{g['compressed']['worst_window_count']:>12} {'❌' if g['compressed']['violates'] else '✓':>8}",
+            f"  {'令牌桶':>12} {g['token_bucket']['allowed']:>6} {g['token_bucket']['rejected']:>6} "
+            f"{g['token_bucket']['worst_window_count']:>12} {'❌' if g['token_bucket']['violates'] else '✓':>8}",
+            "",
+        ]
+
+        strict_vs_tb = g['token_bucket']['allowed'] - g['strict']['allowed']
+        strict_vs_comp = g['compressed']['allowed'] - g['strict']['allowed']
+
+        lines.append(f"    差异摘要:")
+        if strict_vs_tb != 0:
+            sign = "+" if strict_vs_tb > 0 else ""
+            lines.append(
+                f"      令牌桶 vs 严格: 通过数差 {sign}{strict_vs_tb}, "
+                f"最坏窗口差 {g['token_bucket']['worst_window_count'] - g['strict']['worst_window_count']}"
+            )
+        else:
+            lines.append(f"      令牌桶 vs 严格: 通过数相同")
+
+        if strict_vs_comp != 0:
+            sign = "+" if strict_vs_comp > 0 else ""
+            lines.append(
+                f"      压缩版 vs 严格: 通过数差 {sign}{strict_vs_comp}, "
+                f"最坏窗口差 {g['compressed']['worst_window_count'] - g['strict']['worst_window_count']}"
+            )
+        else:
+            lines.append(f"      压缩版 vs 严格: 通过数相同")
+        lines.append("")
+
+    lines.append("=" * 78)
+    return "\n".join(lines)
+
+
+def parse_batch_input(text: str) -> List[Dict[str, Any]]:
+    """
+    从文本解析多组请求序列
+
+    格式：
+      # 注释行
+      场景名: 0.0 0.1 0.2 0.3 ...
+      另一个场景: 0.0 0.05 0.1 ...
+
+    或带 key 的格式（用于 multikey）：
+      场景名:
+        0.0 user_A
+        0.1 user_B
+        0.2 user_A
+    """
+    groups = []
+    current_name = None
+    current_times = []
+
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if ":" in line and not line[0].isdigit():
+            if current_name is not None and current_times:
+                groups.append({"name": current_name, "times": current_times})
+            parts = line.split(":", 1)
+            current_name = parts[0].strip()
+            rest = parts[1].strip()
+            current_times = []
+            if rest:
+                for token in rest.split():
+                    try:
+                        current_times.append(float(token))
+                    except ValueError:
+                        pass
+        else:
+            try:
+                current_times.append(float(line.split()[0]))
+            except (ValueError, IndexError):
+                pass
+
+    if current_name is not None and current_times:
+        groups.append({"name": current_name, "times": current_times})
+
+    return groups
+
+
+def parse_batch_input_with_keys(text: str) -> List[Tuple[float, str]]:
+    """
+    从文本解析带 key 的请求序列
+
+    格式（每行: 时间 key）：
+      0.0 user_A
+      0.1 user_B
+      0.2 user_A
+    """
+    requests = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                t = float(parts[0])
+                key = parts[1]
+                requests.append((t, key))
+            except ValueError:
+                pass
+    return requests
